@@ -91,9 +91,28 @@ export function resetGravityState(): void {
 export function getOrCreateHoldTimeEntity(userKey: string): Entity {
   const key = userKey.toLowerCase()
   let entity = holdTimeEntities.get(key)
-  if (entity) return entity
+  if (entity) {
+    // [HT-PROV] debug: the map is returning a cached entity. If it is a RESERVED
+    // (avatar-range, <512) entity, or has lost its component, that is the bug we
+    // are hunting — log the decoded number/version and whether an avatar occupies
+    // that slot right now. Entity encoding: number = id & 0xffff, version = id>>16.
+    const num = (entity as number) & 0xffff
+    if (num < 512 || !PlayerFlagHoldTime.has(entity)) {
+      const ver = ((entity as number) >>> 16) & 0xffff
+      console.log(
+        `[HT-PROV] cached entity=${entity} num=${num} v=${ver}${num < 512 ? ' RESERVED' : ''} ` +
+          `hasComponent=${PlayerFlagHoldTime.has(entity)} avatarOnSlot=${PlayerIdentityData.getOrNull(entity) != null} key=${key.slice(0, 8)}`
+      )
+    }
+    return entity
+  }
 
   entity = engine.addEntity()
+  // [HT-PROV] debug: addEntity() must always return a dynamic entity (>=512). If
+  // this ever fires, the SDK handed us a reserved slot — extraordinary.
+  if (((entity as number) & 0xffff) < 512) {
+    console.log(`[HT-PROV] addEntity() returned RESERVED entity=${entity} for ${key.slice(0, 8)} !!!`)
+  }
   PlayerFlagHoldTime.create(entity, { playerId: key, seconds: 0 })
   syncEntity(entity, [PlayerFlagHoldTime.componentId], getHoldTimeEntityEnumId(key))
   holdTimeEntities.set(key, entity)
@@ -445,6 +464,15 @@ export function holdTimeServerSystem(dt: number): void {
   if (holdTimeAccum < HOLD_TIME_SYNC_INTERVAL) return
 
   const entity = getOrCreateHoldTimeEntity(carrierKey)
+  // [HT-PROV] debug: capture the exact entity id about to be getMutable'd when its
+  // component is missing — this is the throw seen in production ("... for <id> not found").
+  if (!PlayerFlagHoldTime.has(entity)) {
+    const num = (entity as number) & 0xffff
+    console.log(
+      `[HT-PROV] holdTimeServerSystem MISS entity=${entity} num=${num} v=${((entity as number) >>> 16) & 0xffff}` +
+        `${num < 512 ? ' RESERVED' : ''} avatarOnSlot=${PlayerIdentityData.getOrNull(entity) != null} carrier=${carrierKey.slice(0, 8)}`
+    )
+  }
   const mutable = PlayerFlagHoldTime.getMutable(entity)
   mutable.seconds += holdTimeAccum
   holdTimeAccum = 0

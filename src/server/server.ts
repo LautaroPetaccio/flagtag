@@ -206,6 +206,13 @@ function reconcileHoldTimeEntities() {
   let count = 0
   for (const [entity, data] of engine.getEntitiesWith(PlayerFlagHoldTime)) {
     const key = data.playerId.toLowerCase()
+    // [HT-PROV] debug: if a hold-time component is found on a RESERVED (avatar,
+    // <512) entity at hydration, reconcile would cache that entity — the smoking
+    // gun for the "for <id> not found" error once the avatar slot is deleted.
+    const num = (entity as number) & 0xffff
+    if (num < 512) {
+      console.log(`[HT-PROV] reconcile: hold-time component on RESERVED entity=${entity} num=${num} playerId=${data.playerId.slice(0, 8)}`)
+    }
     if (!holdTimeEntities.has(key)) {
       holdTimeEntities.set(key, entity)
       knownPlayers.add(key)
