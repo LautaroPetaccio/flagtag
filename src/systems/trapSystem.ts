@@ -32,6 +32,7 @@ import { triggerHitFlash } from '../gameState/hitFlashState'
 import { getLocalUpgrades, isWinsLoaded } from '../gameState/playerUpgradeState'
 import { isDrownRespawning } from './waterSystem'
 import { showHitEffect } from './combatSystem'
+import { hasLocalFlagImmunity } from '../gameState/flagImmunityState'
 import { playSpatialSound } from '../utils/spatialAudio'
 
 
@@ -162,6 +163,17 @@ function hideSplat(entity: Entity): void {
 
 // ── Client cooldown tracking ──
 let lastLocalTrapDropTime = 0
+
+/**
+ * The sender's own position, attached to requestBanana so the server drops the trap
+ * where the player actually IS — its replicated view can lag several meters under
+ * load. (0,0,0) when the Transform isn't ready; the server treats that as absent.
+ */
+function myPositionPayload(): { x: number; y: number; z: number } {
+  if (!Transform.has(engine.PlayerEntity)) return { x: 0, y: 0, z: 0 }
+  const p = Transform.get(engine.PlayerEntity).position
+  return { x: p.x, y: p.y, z: p.z }
+}
 
 function getActiveCooldown(): number {
   return getLocalUpgrades().equippedTrap === 'bomb' ? BOMB_COOLDOWN_SEC : TRAP_COOLDOWN_SEC
@@ -568,6 +580,11 @@ function updateMsgTrapVisuals(dt: number): void {
       const dy = playerPos.y - vis.currentY
       const dist = Math.sqrt(dx * dx + dy * dy + dz * dz)
       if (dist < TRAP_TRIGGER_RADIUS && trapStaggerUntil <= now) {
+        // Flag-pickup/steal shield: server ignores the hit, so skip client prediction too.
+        // Prevents shielded carriers from being locally stunned + flashed on banana walk-in.
+        if (hasLocalFlagImmunity()) {
+          continue
+        }
         // Predict the stagger locally — server will confirm and remove the trap
         triggerHitFlash(TRAP_STAGGER_MS)
         triggerEmote({ predefinedEmote: 'getHit' })
@@ -591,6 +608,9 @@ function updateMsgTrapVisuals(dt: number): void {
 
 /** Drop a trap from the UI (mobile tap). Same logic as F key press. */
 export function triggerTrapFromUI(): void {
+  // Match the F-key path's guards so mobile can't drop during the round-end
+  // cinematic or while spectating.
+  if (isCinematicActive() || isSpectatorMode()) return
   if (isDrownRespawning()) return
   if (!isWinsLoaded() && isServerConnected()) return  // Block traps until profile loaded (skip if no server)
   const now = Date.now()
@@ -604,7 +624,7 @@ export function triggerTrapFromUI(): void {
 
   if (serverUp) {
     console.log('[Trap] 🪤 UI tap — requesting trap drop (server)')
-    room.send('requestBanana', { t: 0 })
+    room.send('requestBanana', { t: 0, ...myPositionPayload() })
   } else {
     console.log('[Trap] 🪤 UI tap — dropping trap locally (no server)')
     dropTrapLocally()
@@ -671,7 +691,7 @@ export function trapClientSystem(dt: number): void {
     if (serverUp) {
       // Production: send to server
       console.log('[Trap] 🪤 F pressed — requesting trap drop (server)')
-      room.send('requestBanana', { t: 0 })
+      room.send('requestBanana', { t: 0, ...myPositionPayload() })
     } else {
       // Local test: create trap client-side
       console.log('[Trap] 🪤 F pressed — dropping trap locally (no server)')

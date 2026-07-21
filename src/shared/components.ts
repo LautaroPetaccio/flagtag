@@ -44,24 +44,11 @@ Flag.validateBeforeChange((value) => value.senderAddress === AUTH_SERVER_PEER_ID
 
 export const PlayerFlagHoldTime = engine.defineComponent('ctf-player-flag-hold-time', {
   playerId: Schemas.String,
-  seconds: Schemas.Float
-}, { playerId: '', seconds: 0 })
+  seconds: Schemas.Float,
+  roundId: Schemas.String
+}, { playerId: '', seconds: 0, roundId: '' })
 
 PlayerFlagHoldTime.validateBeforeChange((value) => value.senderAddress === AUTH_SERVER_PEER_ID)
-
-const HOLD_TIME_ENTITY_BASE = 10000
-
-function hashString(s: string): number {
-  let h = 0
-  for (let i = 0; i < s.length; i++) {
-    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0
-  }
-  return h >>> 0
-}
-
-export function getHoldTimeEntityEnumId(userId: string): number {
-  return HOLD_TIME_ENTITY_BASE + (hashString(userId.toLowerCase()) % 100000)
-}
 
 // ── Countdown timer ──
 

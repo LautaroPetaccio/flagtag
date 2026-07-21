@@ -33,6 +33,7 @@ import { BOMB_FUSE_SEC, BOMB_EXPLOSION_RADIUS } from '../shared/components'
 
 const BOMB_STAGGER_MS = 1000 // match regular hit stun duration
 import { triggerHitFlash } from '../gameState/hitFlashState'
+import { hasLocalFlagImmunity } from '../gameState/flagImmunityState'
 import { showHitEffect, playHitSound } from './combatSystem'
 import { isCinematicActive } from '../gameState/cinematicState'
 import { isDrownRespawning } from './waterSystem'
@@ -47,8 +48,13 @@ const LOCAL_GRAVITY = 15
 const HIDDEN_POS = Vector3.create(0, -200, 0)
 
 // ── Bomb visual pool ──
+// Each pooled bomb is a parent Transform holding TWO preloaded child GltfContainers
+// (normal + red). Blinking toggles their scale instead of swapping the GLB via
+// GltfContainer.createOrReplace — the latter accelerates to every 100ms and is
+// exactly the model-swap churn the pool exists to avoid (see projectile/pool.ts).
 const BOMB_POOL_SIZE = 6
 const bombPool: Entity[] = []
+const bombModelChildren = new Map<Entity, { normal: Entity; red: Entity }>()
 let bombPoolReady = false
 
 export function initBombPool(): void {
@@ -56,16 +62,36 @@ export function initBombPool(): void {
   bombPoolReady = true
   for (let i = 0; i < BOMB_POOL_SIZE; i++) {
     const e = engine.addEntity()
-    // Use tiny scale (not zero) so the engine actually loads the GLB model
+    // Use tiny scale (not zero) so the engine actually loads the child GLB models
     Transform.create(e, { position: HIDDEN_POS, scale: Vector3.create(0.001, 0.001, 0.001) })
-    GltfContainer.create(e, {
+    // Two child models, both preloaded once. Children inherit the parent scale,
+    // so identity scale here renders at the parent's scale.
+    const normal = engine.addEntity()
+    Transform.create(normal, { parent: e, position: Vector3.Zero(), scale: Vector3.One() })
+    GltfContainer.create(normal, {
       src: BOMB_MODEL_SRC,
       visibleMeshesCollisionMask: 0,
       invisibleMeshesCollisionMask: 0
     })
+    const red = engine.addEntity()
+    Transform.create(red, { parent: e, position: Vector3.Zero(), scale: Vector3.One() })
+    GltfContainer.create(red, {
+      src: BOMB_RED_MODEL_SRC,
+      visibleMeshesCollisionMask: 0,
+      invisibleMeshesCollisionMask: 0
+    })
     bombPool.push(e)
+    bombModelChildren.set(e, { normal, red })
   }
   console.log('[Bomb] 💣 Pre-created bomb visual pool of', BOMB_POOL_SIZE)
+}
+
+/** Show the normal model and hide the red one (or vice versa) via child scale. */
+function setBombBlinkModel(bombEntity: Entity, showRed: boolean): void {
+  const children = bombModelChildren.get(bombEntity)
+  if (!children) return
+  if (Transform.has(children.normal)) Transform.getMutable(children.normal).scale = showRed ? Vector3.Zero() : Vector3.One()
+  if (Transform.has(children.red)) Transform.getMutable(children.red).scale = showRed ? Vector3.One() : Vector3.Zero()
 }
 
 function acquireBombFromPool(): Entity | null {
@@ -364,24 +390,33 @@ room.onMessage('bombExploded', (data) => {
     if (isVictim) {
       const now = Date.now()
       if (bombStaggerUntil <= now) {
-        console.log('[Bomb] 💣 Local player hit by explosion!')
+        // Flag pickup/steal shield: keep the knockback impulse (feels good,
+        // tactical juice), but skip the stun, flash, hit VFX, sound, emote,
+        // and InputModifier lock. Server also ignores the hit for flag-drop
+        // purposes, so the flag stays safe.
+        const immune = hasLocalFlagImmunity()
+        console.log(immune
+          ? '[Bomb] 🛡️ Local player in explosion but flag-immune — knockback only'
+          : '[Bomb] 💣 Local player hit by explosion!')
         // ORDER MATTERS: knockback FIRST, InputModifier LAST.
         // If InputModifier is applied before knockback, the SDK's knockback conflicts
         // with the movement lock and leaves the player unable to move until any input
         // event (throwing a boomerang, reload) shakes it loose.
         Physics.applyKnockbackToPlayer(pos, 40, BOMB_EXPLOSION_RADIUS, KnockbackFalloff.LINEAR)
-        triggerHitFlash(BOMB_STAGGER_MS)
-        // Red-star hit VFX + sound at player position (parity with boomerang hits)
-        const vfxPos = Transform.has(engine.PlayerEntity)
-          ? Transform.get(engine.PlayerEntity).position
-          : pos
-        showHitEffect(vfxPos)
-        playHitSound(vfxPos)
-        triggerEmote({ predefinedEmote: 'getHit' })
-        InputModifier.createOrReplace(engine.PlayerEntity, {
-          mode: InputModifier.Mode.Standard({ disableAll: true, disableGliding: true, disableDoubleJump: true })
-        })
-        bombStaggerUntil = now + BOMB_STAGGER_MS
+        if (!immune) {
+          triggerHitFlash(BOMB_STAGGER_MS)
+          // Red-star hit VFX + sound at player position (parity with boomerang hits)
+          const vfxPos = Transform.has(engine.PlayerEntity)
+            ? Transform.get(engine.PlayerEntity).position
+            : pos
+          showHitEffect(vfxPos)
+          playHitSound(vfxPos)
+          triggerEmote({ predefinedEmote: 'getHit' })
+          InputModifier.createOrReplace(engine.PlayerEntity, {
+            mode: InputModifier.Mode.Standard({ disableAll: true, disableGliding: true, disableDoubleJump: true })
+          })
+          bombStaggerUntil = now + BOMB_STAGGER_MS
+        }
       }
     }
   }
@@ -396,11 +431,8 @@ function createBombVisual(x: number, y: number, z: number, ownerId: string, bomb
   const t = Transform.getMutable(entity)
   t.position = Vector3.create(x, y, z)
   t.scale = BOMB_SCALE
-  GltfContainer.createOrReplace(entity, {
-    src: BOMB_MODEL_SRC,
-    visibleMeshesCollisionMask: 0,
-    invisibleMeshesCollisionMask: 0
-  })
+  // Models are already loaded on the pooled children — just show the normal one.
+  setBombBlinkModel(entity, false)
 
   // Fire ground raycast
   const groundRayEntity = engine.addEntity()
@@ -512,12 +544,8 @@ export function bombClientSystem(dt: number): void {
       vis.blinkOn = !vis.blinkOn
       vis.lastBlinkMs = now
 
-      // Flash red model and pulse scale on blink
-      GltfContainer.createOrReplace(vis.entity, {
-        src: vis.blinkOn ? BOMB_RED_MODEL_SRC : BOMB_MODEL_SRC,
-        visibleMeshesCollisionMask: 0,
-        invisibleMeshesCollisionMask: 0
-      })
+      // Flash red model by toggling child visibility (no GltfContainer swap)
+      setBombBlinkModel(vis.entity, vis.blinkOn)
     }
 
     // Update fuse flame — flicker size/position

@@ -5,24 +5,28 @@
 
 import { engine, Transform, PlayerIdentityData } from '@dcl/sdk/ecs'
 import { Vector3 } from '@dcl/sdk/math'
-import { Storage } from '@dcl/sdk/server'
 import {
-  Flag, FlagState, PlayerFlagHoldTime, CountdownTimer, LeaderboardState, AllTimeLeaderboardState,
-  getRandomSpawnPoint, SyncIds, getCurrentMonthString
+  Flag, FlagState, PlayerFlagHoldTime, CountdownTimer, LeaderboardState,
+  getRandomSpawnPoint, SyncIds
 } from '../shared/components'
 import { room } from '../shared/messages'
 import {
   flagEntity, countdownEntity,
-  leaderboardEntity, allTimeLeaderboardEntity,
+  leaderboardEntity,
   holdTimeEntities, knownPlayers, playerNames,
   lastStealTime, playerLifetimeHoldTimeCache,
-  SPLASH_DURATION_MS,
+  SPLASH_DURATION_MS, roundParticipants,
+  currentScoreRoundId, scoreRoundSessionId, setCurrentScoreRoundId,
 } from './serverState'
-import { persistFlagState, persistLeaderboard, persistAllTimeLeaderboard } from './persistence'
-import { parseLeaderboardJson, incrementLeaderboardWins, checkLeaderboardDailyReset } from './leaderboard'
+import { persistFlagState, persistLeaderboard } from './persistence'
+import {
+  parseLeaderboardJson, incrementLeaderboardWins, checkLeaderboardDailyReset,
+  isDailyLeaderboardLoaded, recoverDailyLeaderboard,
+  incrementAllTimeLeaderboardWins,
+} from './leaderboard'
 
-import { awardRoundCoins } from './economy'
-import { flushHoldTimeAccum, clearHoldTimeAccum, getHoldTimeAccumFor, resetGravityState, computeGravityTarget } from './flagLogic'
+import { awardRoundCoins, clearPlayerEconomyState } from './economy'
+import { flushHoldTimeAccum, clearHoldTimeAccum, clearHoldTimeTotals, getHoldTimeAccumFor, resetGravityState, computeGravityTarget, clearLastDropper, ensureFlagEntity } from './flagLogic'
 import { activeTraps, activeProjectiles, activeOrbits, activeBombs, removeTrap, removeProjectile, removeBomb, clearAllCombatCooldowns } from './combat'
 import { spawnMushrooms } from './mushroomSystem'
 import { addPlayerLifetimeWin, addPlayerLifetimeHoldTime, loadPlayerUpgrades, loadPlayerLifetimeWins, loadPlayerLifetimeHoldTime } from './economy'
@@ -30,13 +34,16 @@ import { serializeUpgrades } from '../shared/upgrades'
 import { capture } from './posthog'
 import { EnvVar } from '@dcl/sdk/server'
 import { isPreview } from './analytics'
+import { buildRoundAwardPlayers } from './roundAccounting'
+import { mutateDailyLeaderboardAfterRecovery } from './leaderboardLifecycle'
+import { buildScoreRoundId } from './scoreRoundId'
 
-const ROUND_WINNER_WEBHOOK_FALLBACK = 'https://discordapp.com/api/webhooks/1519451777831796736/HQjwWnNLW0ejguz5N5FcllRTkkl_DeD3xJ-ISFLDLrV5zlxLhvqFDTeNatjB6iZpxRYa'
-let ROUND_WINNER_WEBHOOK = ROUND_WINNER_WEBHOOK_FALLBACK
+// Secret comes from the environment only — never hardcode a webhook token (public bundles).
+let ROUND_WINNER_WEBHOOK = ''
 
 export async function loadRoundWinnerWebhook(): Promise<void> {
-  ROUND_WINNER_WEBHOOK = (await EnvVar.get('DISCORD_ROUND_WINNER_WEBHOOK')) || ROUND_WINNER_WEBHOOK_FALLBACK
-  console.log('[Server] ✅ Round winner webhook loaded')
+  ROUND_WINNER_WEBHOOK = (await EnvVar.get('DISCORD_ROUND_WINNER_WEBHOOK')) || ''
+  console.log(ROUND_WINNER_WEBHOOK ? '[Server] ✅ Round winner webhook loaded from env' : '[Server] ℹ️ No DISCORD_ROUND_WINNER_WEBHOOK set — round announcements disabled')
 }
 
 // ── Lightning state ──
@@ -139,6 +146,11 @@ export function lightningServerSystem(dt: number): void {
         mutable.dropAnchorZ = strikePos.z
         const t = Transform.getMutable(flagEntity)
         t.position = Vector3.create(strikePos.x, strikePos.y, strikePos.z)
+        // Server-initiated drop: without this, whoever dropped the flag BEFORE the
+        // struck carrier picked it up would keep ground-report authority (with a
+        // fresh one-shot re-armed by computeGravityTarget) anchored at the strike
+        // height — lightning strikes high-value carriers, often airborne in updrafts.
+        clearLastDropper()
         computeGravityTarget(strikePos.y)
         persistFlagState().catch(e => console.error('[Server] persistFlagState error:', e))
       }
@@ -201,21 +213,31 @@ export function countdownServerSystem(): void {
     console.log('[Server] ⏰ Round end! Triggered at roundEndTimeMs:', new Date(timer.roundEndTimeMs).toISOString(), `(${msAfter}ms after)`)
     
     const nextBoundary = (Math.floor(now / intervalMs) + 1) * intervalMs
-    
+    const nextScoreRoundId = buildScoreRoundId(scoreRoundSessionId, nextBoundary)
     const mutable = CountdownTimer.getMutable(countdownEntity)
     mutable.roundEndTimeMs = nextBoundary
     
     console.log('[Server] Next round will end at:', new Date(nextBoundary).toISOString())
     
-    handleRoundEnd(timer.roundEndTimeMs).catch((err) => {
+    handleRoundEnd(timer.roundEndTimeMs, nextScoreRoundId).catch((err) => {
       console.error('[Server.ERROR] handleRoundEnd failed:', err)
       try {
+        setCurrentScoreRoundId(nextScoreRoundId)
         const flag = Flag.getOrNull(flagEntity)
         if (flag && flag.state === FlagState.Carried) {
           const mutable = Flag.getMutable(flagEntity)
           mutable.state = FlagState.AtBase
           mutable.carrierPlayerId = ''
         }
+        for (const [entity] of engine.getEntitiesWith(PlayerFlagHoldTime)) {
+          const holdTime = PlayerFlagHoldTime.getMutableOrNull(entity)
+          if (holdTime) {
+            holdTime.seconds = 0
+            holdTime.roundId = currentScoreRoundId
+          }
+        }
+        clearHoldTimeAccum()
+        clearHoldTimeTotals()
         lightningRollTimer = 0
         lightningStrikeScheduled = false
         lightningWarningTimer = 0
@@ -255,9 +277,10 @@ function computeMatchId(roundEndMs: number): string {
   return `${YYYY}${MM}${DD}-${HH}-${NN}`
 }
 
-async function handleRoundEnd(endedRoundEndMs: number): Promise<void> {
+async function handleRoundEnd(endedRoundEndMs: number, nextScoreRoundId: string): Promise<void> {
   const now = Date.now()
   const matchId = computeMatchId(endedRoundEndMs)
+  const endedScoreRoundId = currentScoreRoundId
   console.log('[Server] Match ID:', matchId)
 
   // ══════════════════════════════════════════════════════════════════════
@@ -271,19 +294,38 @@ async function handleRoundEnd(endedRoundEndMs: number): Promise<void> {
   // FAST PATH: Read scores + send respawnPlayers ASAP, cleanup after.
   // ══════════════════════════════════════════════════════════════════════
 
+  // Guard against a recycled flag entity slot: this function calls Flag.getMutable
+  // unconditionally below, which would throw (and the emergency recovery also skips it).
+  ensureFlagEntity()
+
   // ── 0. Flush hold time so final scores are accurate ──
   flushHoldTimeAccum()
 
   // ── 1. Read scores BEFORE resetting ──
+  // Aggregate by normalized player id, taking the MAX score per player: after a
+  // mid-round restart, a CRDT-replayed phantom entity (reserved range — the boot
+  // reconciler deliberately leaves those untouched) can coexist with the player's
+  // live entity. Counting both would double every award downstream: coins,
+  // daily/all-time wins, lifetime totals, and the podium. Max, not sum — the two
+  // entities may reflect the same accumulation, so summing would double-count.
   let maxSeconds = 0
-  const players: { userId: string; seconds: number }[] = []
-
+  const secondsByPlayer = new Map<string, number>()
   for (const [, data] of engine.getEntitiesWith(PlayerFlagHoldTime)) {
+    if (data.roundId !== endedScoreRoundId) continue
     if (data.seconds > 0) {
-      players.push({ userId: data.playerId, seconds: data.seconds })
+      const key = data.playerId.toLowerCase()
+      const prev = secondsByPlayer.get(key) ?? 0
+      if (data.seconds > prev) secondsByPlayer.set(key, data.seconds)
       if (data.seconds > maxSeconds) maxSeconds = data.seconds
     }
   }
+  const players: { userId: string; seconds: number }[] = []
+  for (const [userId, seconds] of secondsByPlayer) {
+    players.push({ userId, seconds })
+  }
+  // Participation is independent of scoring: players who joined the round but never
+  // held the flag still receive the documented participation coin.
+  const awardPlayers = buildRoundAwardPlayers(roundParticipants, secondsByPlayer)
 
   // ── 2. Compute top 3 ──
   const topPlayers = [...players]
@@ -300,6 +342,10 @@ async function handleRoundEnd(endedRoundEndMs: number): Promise<void> {
       }
     })
   const winnersJson = JSON.stringify(topPlayers)
+
+  // Everything read above belongs to the ending round. Switch the authoritative
+  // id only after final scores are captured, then stamp every reset entity below.
+  setCurrentScoreRoundId(nextScoreRoundId)
 
   // ── 2a. Reset flag BEFORE sending respawnPlayers ──
   // Flag must be at base before clients receive the message, so the CRDT
@@ -331,13 +377,22 @@ async function handleRoundEnd(endedRoundEndMs: number): Promise<void> {
   for (const [, identity] of engine.getEntitiesWith(PlayerIdentityData)) {
     connectedNow.add(identity.address.toLowerCase())
   }
+  roundParticipants.clear()
+  for (const userId of connectedNow) roundParticipants.add(userId)
 
   const entitiesToRemove: string[] = []
   for (const [entity, data] of engine.getEntitiesWith(PlayerFlagHoldTime)) {
     const key = data.playerId.toLowerCase()
-    if (connectedNow.has(key)) {
-      PlayerFlagHoldTime.getMutable(entity).seconds = 0
-    } else {
+    // Always zero the score on the entity handle we're iterating (safe: it currently
+    // carries the component). This includes reserved-range/phantom entities that the
+    // startup reconciler skips and the removal branch below can't reach — otherwise a
+    // frozen seconds=200 phantom would "win" every round forever after a mid-round restart.
+    const m = PlayerFlagHoldTime.getMutableOrNull(entity)
+    if (m) {
+      m.seconds = 0
+      m.roundId = currentScoreRoundId
+    }
+    if (!connectedNow.has(key)) {
       entitiesToRemove.push(key)
     }
   }
@@ -355,6 +410,8 @@ async function handleRoundEnd(endedRoundEndMs: number): Promise<void> {
 
   // Force-clear accumulator again (defensive)
   clearHoldTimeAccum()
+  // New round — shadow totals must not seed recreated entities with last round's scores
+  clearHoldTimeTotals()
 
   // ── 3. Release all active traps back to pool ──
   for (const trap of activeTraps) {
@@ -409,59 +466,80 @@ async function handleRoundEnd(endedRoundEndMs: number): Promise<void> {
   console.log('[Server] Round end splash set, displayUntil:', new Date(timerMutable.roundEndDisplayUntilMs).toISOString())
 
   // ── 5b. Award coins ──
-  await awardRoundCoins(players)
-
-  // ── 6. Check for daily/monthly leaderboard reset ──
-  await checkLeaderboardDailyReset()
-
-  // ── 7. Update all three leaderboards ──
-  if (maxSeconds > 0) {
-    const dailyEntries = parseLeaderboardJson(LeaderboardState.getOrNull(leaderboardEntity)?.json)
-    incrementLeaderboardWins(dailyEntries, players, maxSeconds)
-    const dailyJson = JSON.stringify(dailyEntries)
-    LeaderboardState.getMutable(leaderboardEntity).json = dailyJson
-    await persistLeaderboard(dailyJson)
-
-    // All-time: read full data from Storage, update, persist full, sync compact
-    const atFullJson = (await (async () => { try { return await Storage.get<string>('allTimeLeaderboard') } catch { return null } })()) || '[]'
-    const atEntries = parseLeaderboardJson(atFullJson)
-    incrementLeaderboardWins(atEntries, players, maxSeconds)
-    await persistAllTimeLeaderboard(JSON.stringify(atEntries))
-    // Compact format for CRDT sync
-    atEntries.sort((a, b) => b.roundsWon - a.roundsWon)
-    const atCompact = atEntries.slice(0, 500).map(e => ({ n: e.name, w: e.roundsWon }))
-    AllTimeLeaderboardState.getMutable(allTimeLeaderboardEntity).json = JSON.stringify(atCompact)
-
-    const currentMonth = getCurrentMonthString()
+  await awardRoundCoins(awardPlayers)
+  // Awards re-create per-player economy state (balance chains, pending persists) for
+  // players who disconnected mid-round; clean it up or those maps leak an entry per
+  // departed player. Also force-flushes their awarded balance.
+  for (const p of awardPlayers) {
+    if (!connectedNow.has(p.userId.toLowerCase())) clearPlayerEconomyState(p.userId)
   }
 
-  // ── 7b. Award lifetime wins ──
+  // Steps 6–7d are isolated per step (and per player where it matters): storage reads
+  // are strict and can reject on a timeout — one failed step must not skip the rest of
+  // round-end (webhook, flag persist), and one player's failure must not skip the others.
+
+  // ── 6–7. Recover/reset/update the daily leaderboard as one guarded transition ──
+  // If recovery or reset fails at midnight, mutation never runs, so yesterday's
+  // entries cannot be mixed into the new day. All-time updates remain independent.
+  try {
+    await mutateDailyLeaderboardAfterRecovery(
+      {
+        isLoaded: isDailyLeaderboardLoaded,
+        recover: recoverDailyLeaderboard,
+        reset: () => checkLeaderboardDailyReset(),
+      },
+      maxSeconds > 0
+        ? async () => {
+            const dailyEntries = parseLeaderboardJson(LeaderboardState.getOrNull(leaderboardEntity)?.json)
+            incrementLeaderboardWins(dailyEntries, players, maxSeconds)
+            const dailyJson = JSON.stringify(dailyEntries)
+            await persistLeaderboard(dailyJson)
+            LeaderboardState.getMutable(leaderboardEntity).json = dailyJson
+          }
+        : undefined
+    )
+  } catch (err) {
+    console.error('[Server] ❌ Daily leaderboard transition failed — skipping the daily update this round:', err)
+  }
+
+  // ── 7a. Update the all-time leaderboard (independent of the daily board) ──
   if (maxSeconds > 0) {
-    const winners = players.filter(p => p.seconds >= maxSeconds)
-    for (const w of winners) {
-      const newWins = await addPlayerLifetimeWin(w.userId)
-      console.log('[LifetimeWins] Player', w.userId.slice(0, 8), 'now has', newWins, 'lifetime wins')
+    try {
+      // Serialized with name patches so neither read-modify-write can overwrite the other.
+      await incrementAllTimeLeaderboardWins(players, maxSeconds)
+    } catch (err) { console.error('[Server] ❌ All-time leaderboard update failed:', err) }
+  }
+
+  // ── 7b. Lifetime stats: wins + hold time + fresh stats push ──
+  // One pipeline per player, all players CONCURRENT: the old sequential loops cost
+  // a ~2s storage round trip per departed player per step, stretching round end
+  // linearly with player count (safeStorage caps the fan-out). Order INSIDE a
+  // pipeline still matters — the stats push must read post-update values.
+  await Promise.all(players.map(async (p) => {
+    if (maxSeconds > 0 && p.seconds >= maxSeconds) {
+      try {
+        const newWins = await addPlayerLifetimeWin(p.userId)
+        console.log('[LifetimeWins] Player', p.userId.slice(0, 8), 'now has', newWins, 'lifetime wins')
+      } catch (err) { console.error('[LifetimeWins] Failed for', p.userId.slice(0, 8), err) }
     }
-  }
-
-  // ── 7c. Accumulate lifetime flag hold time ──
-  for (const p of players) {
     if (p.seconds > 0) {
-      const newTotal = await addPlayerLifetimeHoldTime(p.userId, p.seconds)
-      console.log('[LifetimeHoldTime] Player', p.userId.slice(0, 8), '+', p.seconds.toFixed(1), 's -> total:', newTotal.toFixed(1), 's')
+      try {
+        const newTotal = await addPlayerLifetimeHoldTime(p.userId, p.seconds)
+        console.log('[LifetimeHoldTime] Player', p.userId.slice(0, 8), '+', p.seconds.toFixed(1), 's -> total:', newTotal.toFixed(1), 's')
+      } catch (err) { console.error('[LifetimeHoldTime] Failed for', p.userId.slice(0, 8), err) }
     }
-  }
-
-  // ── 7d. Send updated lifetime stats to each player via WebSocket ──
-  for (const p of players) {
-    const upgrades = await loadPlayerUpgrades(p.userId)
-    const wins = await loadPlayerLifetimeWins(p.userId)
-    const holdTime = await loadPlayerLifetimeHoldTime(p.userId)
-    room.send('upgradesResponse', { upgradesJson: serializeUpgrades(upgrades), wins, lifetimeHoldTime: holdTime }, { to: [p.userId] })
-  }
+    try {
+      const upgrades = await loadPlayerUpgrades(p.userId)
+      const wins = await loadPlayerLifetimeWins(p.userId)
+      const holdTime = await loadPlayerLifetimeHoldTime(p.userId)
+      room.send('upgradesResponse', { upgradesJson: serializeUpgrades(upgrades), wins, lifetimeHoldTime: holdTime }, { to: [p.userId] })
+    } catch (err) { console.error('[Server] Round-end stats send failed for', p.userId.slice(0, 8), err) }
+  }))
 
   // ── 8. Persist flag state ──
-  await persistFlagState()
+  try {
+    await persistFlagState()
+  } catch (err) { console.error('[Server] ❌ Round-end flag persist failed:', err) }
 
   // ── 8b. Discord webhook: announce round winner(s) ──
   if (maxSeconds > 0) {
@@ -477,7 +555,9 @@ async function handleRoundEnd(endedRoundEndMs: number): Promise<void> {
       else fetch(ROUND_WINNER_WEBHOOK, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content })
+        // allowed_mentions: names are client-supplied — a player named "@everyone" must
+        // never ping the whole Discord server.
+        body: JSON.stringify({ content, allowed_mentions: { parse: [] } })
       }).then(() => {}, () => {})
     }
   }
@@ -504,8 +584,6 @@ async function handleRoundEnd(endedRoundEndMs: number): Promise<void> {
 }
 
 // ── Message handlers ──
-const ADMIN_ADDRESSES = ['0x1e93e534c5e26b01ed242410b43ae23dd0faa52b']
-
 export function registerRoundHandlers(): void {
   room.onMessage('requestUpdraftLocation', (_data, _context) => {
     try {

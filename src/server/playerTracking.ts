@@ -12,19 +12,37 @@ import {
   playerBoomerangColors, playerCoinBalances, playerUpgradeData, playerLifetimeWinsCache,
   playerLifetimeHoldTimeCache, lastStealTime, deathPenaltyCooldowns,
   sessionDeaths, sessionBananasDropped, sessionBoomerangsFired,
-  isRealName, clearPositionHistory
+  isRealName, clearPositionHistory, roundParticipants,
+  nameChangeCooldowns, feedbackCooldowns,
 } from './serverState'
 import { persistPlayerNames } from './persistence'
 import { updatePlayerName } from './leaderboard'
 import { getOrCreateHoldTimeEntity } from './flagLogic'
-import { loadPlayerCoinBalance, loadPlayerLifetimeHoldTime } from './economy'
+import { clearPlayerEconomyState } from './economy'
+import { ensurePlayerHydrated } from './playerDoc'
 import { clearCombatCooldowns } from './combat'
-import { schedulePlayerJoinDiscord } from './analytics'
+import { clearPlayerMushroomState } from './mushroomSystem'
+import { schedulePlayerJoinDiscord, markVisitorDataDirty } from './analytics'
 import { capture, identify } from './posthog'
+import {
+  FEEDBACK_COOLDOWN_MS,
+  NAME_CHANGE_COOLDOWN_MS,
+  pruneExpiredTimestamps,
+} from './cooldownValidation'
 
 // ── Player join/leave detection ──
 
+const COOLDOWN_PRUNE_INTERVAL_MS = 10_000
+let nextCooldownPruneMs = 0
+
 export function playerTrackingSystem(): void {
+  const now = Date.now()
+  if (now >= nextCooldownPruneMs) {
+    nextCooldownPruneMs = now + COOLDOWN_PRUNE_INTERVAL_MS
+    pruneExpiredTimestamps(nameChangeCooldowns, now, NAME_CHANGE_COOLDOWN_MS)
+    pruneExpiredTimestamps(feedbackCooldowns, now, FEEDBACK_COOLDOWN_MS)
+  }
+
   // Build set of currently connected players (normalized to lowercase)
   const nowConnected = new Set<string>()
   for (const [, identity] of engine.getEntitiesWith(PlayerIdentityData)) {
@@ -38,17 +56,17 @@ export function playerTrackingSystem(): void {
     if (!currentlyConnected.has(userKey)) {
       // Player just connected (or reconnected)
       currentlyConnected.add(userKey)
+      roundParticipants.add(userKey)
 
       // Create synced hold time entity if this is a new player
       getOrCreateHoldTimeEntity(userKey)
-      
-      // Load coin balance and create wallet entity
-      loadPlayerCoinBalance(userKey).then(() => {
-      }).catch(err => console.error('[Coins] Error loading wallet for', userKey.slice(0, 8), err))
 
-      // Load lifetime hold time and create synced entity
-      loadPlayerLifetimeHoldTime(userKey).then(() => {
-      }).catch(err => console.error('[LifetimeHoldTime] Error loading for', userKey.slice(0, 8), err))
+      // Hydrate the player's consolidated doc (coins, upgrades, lifetime stats,
+      // blessing) NOW so every later handler — wallet, store, pedestal — answers
+      // from memory instead of paying a ~2s storage round trip mid-interaction.
+      // Failures self-heal: the next handler that needs the data retries hydration.
+      ensurePlayerHydrated(userKey).catch(err =>
+        console.error('[PlayerDoc] Join-time hydration failed for', userKey.slice(0, 8), '— will retry on demand:', err))
 
       // Start/restart visitor session — use persisted name if available
       const playerName = playerNames.get(userKey) || userKey.slice(0, 8)
@@ -130,6 +148,10 @@ export function playerTrackingSystem(): void {
         monthlyVisitor.sessionStartMs = 0
       }
 
+      // Session totals were just finalized — force the next visitor-stat flush past
+      // the throttle (the server can be torn down without warning once the world empties).
+      markVisitorDataDirty()
+
       // Clean up per-player maps to prevent unbounded growth
       playerLifetimeHoldTimeCache.delete(userKey)
       playerBoomerangColors.delete(userKey)
@@ -143,6 +165,10 @@ export function playerTrackingSystem(): void {
       sessionBananasDropped.delete(userKey)
       sessionBoomerangsFired.delete(userKey)
       clearPositionHistory(userKey)
+      clearPlayerEconomyState(userKey)
+      clearPlayerMushroomState(userKey)
+      // Abuse cooldowns intentionally survive reconnects and expire through the
+      // periodic timestamp pruning above.
 
       changed = true
     }

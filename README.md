@@ -57,16 +57,27 @@ src/
 
 Clients send **requests** (e.g. `requestPickup`, `requestShell`); the server validates and broadcasts results. All synced components use `validateBeforeChange()` to reject unauthorized writes.
 
+Server persistence (player wallets, upgrades, leaderboards, flag state) is memory-authoritative with write-behind flushing to Decentraland's Server-Side Storage — see [docs/STORAGE.md](docs/STORAGE.md) for the architecture, the failure modes it defends against, and the one-way `player:{addr}` doc migration (**do not roll back past it**).
+
 ## Development
 
 ### Prerequisites
-- Node.js 18+
+- Node.js 24+
 
 ### Setup & Run
 ```bash
 npm install
 npm run start        # Preview (client + local server)
+npm run test         # Server validation/accounting regression tests
+npm run lint         # TypeScript validation
+npm run test:dependencies # Exercise overridden SDK dependency APIs
+npm run test:cli     # Smoke-test preview/deploy CLI entry points
 ```
+
+The SDK currently declares older major versions for several vulnerable development-tool
+dependencies. Major-version security overrides are scoped to the SDK packages that own
+them; the compatible-major `protobufjs` patch applies across its protocol consumers. Keep
+`npm run build`, `npm run test:cli`, and `npm audit` green when upgrading the SDK.
 
 ### Deploy
 ```bash
@@ -76,6 +87,10 @@ npm run deploy       # Deploy to flagtag.dcl.eth
 ### Other Commands
 ```bash
 npm run build        # Build without deploying
+npm run test         # Run the Jest regression suite
+npm run lint         # Run TypeScript validation
+npm run test:dependencies # Exercise overridden SDK dependency APIs
+npm run test:cli     # Smoke-test preview/deploy CLI entry points
 npm run server-logs  # View server logs from deployed scene
 ```
 
